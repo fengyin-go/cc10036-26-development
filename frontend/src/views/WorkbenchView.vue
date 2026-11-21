@@ -37,6 +37,8 @@
       <button class="btn ghost" data-testid="reset" type="button" @click="resetFilters">重置条件</button>
     </form>
 
+    <GapMonitorPanel v-if="meta.key === 'anomaly_detect'" />
+
     <table class="data-table">
       <thead>
         <tr>
@@ -103,6 +105,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import GapMonitorPanel from '@/views/GapMonitorPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()

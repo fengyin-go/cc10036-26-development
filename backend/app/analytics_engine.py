@@ -463,6 +463,12 @@ class CacheEntry:
     ttl_seconds: int
     hit_count: int = 0
     last_hit_at: float | None = None
+    source_time: float | None = None       # 数据来源时间（观测所属时段）
+    period_start: float | None = None      # 有效观测时段起
+    period_end: float | None = None        # 有效观测时段止
+    missing_points: int = 0                # 来源时段内的缺测点数
+    has_gap: bool = False
+    source: str = "实时采样"               # 实时采样 / 补采 / 历史读值
 
 
 class CacheManager:
@@ -479,6 +485,11 @@ class CacheManager:
         return hashlib.md5(raw.encode()).hexdigest()[:16]
 
     def get(self, key: str) -> Any | None:
+        entry = self.get_entry(key)
+        return entry.result if entry is not None else None
+
+    def get_entry(self, key: str) -> CacheEntry | None:
+        """返回完整缓存条目（含来源时间、有效时段），过期或不存在返回 None。"""
         entry = self._entries.get(key)
         if entry is None:
             return None
@@ -488,17 +499,26 @@ class CacheManager:
         entry.hit_count += 1
         entry.last_hit_at = time.time()
         self._touch(key)
-        return entry.result
+        return entry
 
     def put(
         self, key: str, result: Any, row_count: int = 0,
         ttl_seconds: int = 300, byte_size: int | None = None,
+        *, source_time: float | None = None,
+        period_start: float | None = None,
+        period_end: float | None = None,
+        missing_points: int = 0,
+        has_gap: bool = False,
+        source: str = "实时采样",
     ) -> None:
         if byte_size is None:
             byte_size = len(json.dumps(result, default=str).encode()) if result is not None else 0
         entry = CacheEntry(
             key=key, result=result, row_count=row_count,
             byte_size=byte_size, created_at=time.time(), ttl_seconds=ttl_seconds,
+            source_time=source_time, period_start=period_start,
+            period_end=period_end, missing_points=missing_points,
+            has_gap=has_gap, source=source,
         )
         self._entries[key] = entry
         self._touch(key)
@@ -506,6 +526,25 @@ class CacheManager:
 
     def invalidate(self, key: str) -> bool:
         return self._evict(key)
+
+    def peek_entry(self, key: str) -> CacheEntry | None:
+        """只读查看条目，不增加命中次数；过期条目直接剔除。"""
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        if time.time() - entry.created_at > entry.ttl_seconds:
+            self._evict(key)
+            return None
+        return entry
+
+    def entries_snapshot(self) -> list[CacheEntry]:
+        """返回全部未过期条目的快照（含来源时间与有效时段）。"""
+        now = time.time()
+        alive = [
+            e for e in self._entries.values()
+            if now - e.created_at <= e.ttl_seconds
+        ]
+        return sorted(alive, key=lambda e: e.created_at, reverse=True)
 
     def stats(self) -> dict[str, Any]:
         total_hits = sum(e.hit_count for e in self._entries.values())
@@ -541,6 +580,167 @@ class CacheManager:
             lru_key = self._access_order[0]
             self._evict(lru_key)
             total_mem = sum(e.byte_size for e in self._entries.values())
+
+
+# ---------------------------------------------------------------------------
+# 采样空窗检测（断采识别）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GapWindow:
+    """一段采样空窗：期望区间内连续没有上报点。"""
+    start_time: float          # 空窗起始（期望时间点，含）
+    end_time: float            # 空窗结束（期望时间点，含）
+    expected_points: int       # 该空窗内缺失的期望采样点数
+    source: str = "缺测"       # 缺测原因标识，默认无人上报
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "expected_points": self.expected_points,
+            "source": self.source,
+        }
+
+
+def _normalize_series(
+    series: list[dict[str, Any]] | list[float],
+) -> list[tuple[float, float]]:
+    """把指标序列统一成 (timestamp, value) 有序点列表。
+
+    支持两种输入：
+    - 点对象列表：[{"timestamp": float, "value": float}, ...]
+    - 纯数值列表：按下标 0..n-1 作为时间戳，等价于等间隔完整采样。
+    """
+    points: list[tuple[float, float]] = []
+    for idx, item in enumerate(series):
+        if isinstance(item, dict):
+            if item.get("value") is None:
+                # 显式空点：占位但不计入有效观测
+                continue
+            ts = float(item.get("timestamp", idx))
+            val = float(item["value"])
+        else:
+            ts, val = float(idx), float(item)
+        points.append((ts, val))
+    points.sort(key=lambda p: p[0])
+    return points
+
+
+def detect_sampling_gaps(
+    series: list[dict[str, Any]] | list[float],
+    interval: float | None = None,
+    period_start: float | None = None,
+    period_end: float | None = None,
+) -> dict[str, Any]:
+    """按指标时间序列计算采样空窗检测数据。
+
+    空窗 = 本时段期望采样点中连续无人上报的区间。空窗检测只回答「有没有断采、
+    断在哪里」，不把缺测当成数值 0，因此平稳信号（有点、值不波动）和无人上报
+    （无点）会得到截然不同的结论。
+
+    - interval：期望采样间隔；不传则用相邻观测时间差的中位数推断。
+    - period_start/period_end：本值班时段的期望边界；不传则取观测点的首尾时间。
+    """
+    points = _normalize_series(series)
+    observed_count = len(points)
+
+    if interval is None or interval <= 0:
+        if observed_count >= 2:
+            diffs = sorted(points[i + 1][0] - points[i][0] for i in range(observed_count - 1))
+            interval = diffs[len(diffs) // 2] or 1.0
+        else:
+            interval = 1.0
+    interval = float(interval)
+
+    if observed_count:
+        first_ts = points[0][0]
+        last_ts = points[-1][0]
+    else:
+        first_ts = last_ts = 0.0
+    if period_start is None:
+        period_start = first_ts
+    if period_end is None:
+        period_end = last_ts
+    period_start = float(period_start)
+    period_end = float(period_end)
+
+    span = period_end - period_start
+    expected_total = int(round(span / interval)) + 1 if span >= 0 else observed_count
+
+    # 只统计落在本时段内的观测：时段外的历史点不能充当本时段观测
+    in_period_points = [
+        (ts, v) for ts, v in points if period_start <= ts <= period_end
+    ]
+    in_period_ts = {ts for ts, _ in in_period_points}
+    in_period_count = len(in_period_points)
+
+    # 期望时间点集合，用来判断每个点是否有人上报
+    missing_slots: list[float] = [
+        period_start + i * interval
+        for i in range(max(expected_total, 0))
+        if period_start + i * interval not in in_period_ts
+    ]
+
+    # 连续缺测槽位合并成空窗
+    windows: list[GapWindow] = []
+    for slot in missing_slots:
+        if windows and abs(slot - windows[-1].end_time - interval) < 1e-9:
+            windows[-1].end_time = slot
+            windows[-1].expected_points += 1
+        else:
+            windows.append(GapWindow(start_time=slot, end_time=slot, expected_points=1))
+
+    missing_count = sum(w.expected_points for w in windows)
+    valid_count = max(expected_total - missing_count, 0)
+    coverage = round(valid_count / expected_total, 4) if expected_total else 0.0
+
+    # 有效观测时段：本时段内真正有点覆盖的区间（用于缓存有效性判断）
+    valid_ranges: list[dict[str, float]] = []
+    for ts, _ in in_period_points:
+        if valid_ranges and ts <= valid_ranges[-1]["end_time"] + interval + 1e-9:
+            valid_ranges[-1]["end_time"] = ts
+        else:
+            valid_ranges.append({"start_time": ts, "end_time": ts})
+
+    # 平稳判定只基于本时段真实观测值：有点且波动极小才算平稳；整段缺测不是平稳
+    values = [v for _, v in in_period_points]
+    if values:
+        mean_v = sum(values) / len(values)
+        variance = sum((v - mean_v) ** 2 for v in values) / len(values)
+        std_v = math.sqrt(variance)
+        is_stable = std_v <= max(abs(mean_v) * 0.01, 1e-6)
+    else:
+        mean_v = 0.0
+        std_v = 0.0
+        is_stable = False
+
+    if in_period_count == 0:
+        signal_state = "缺测"       # 本时段无人上报
+    elif windows:
+        signal_state = "断采"       # 有上报但时序点中断
+    else:
+        signal_state = "平稳"
+
+    return {
+        "interval": interval,
+        "period_start": period_start,
+        "period_end": period_end,
+        "expected_points": expected_total,
+        "observed_points": in_period_count,
+        "total_input_points": observed_count,
+        "missing_points": missing_count,
+        "coverage_rate": coverage,
+        "has_gap": missing_count > 0,
+        "is_fully_sampled": missing_count == 0 and in_period_count > 0,
+        "is_stable": is_stable,                       # 信号平稳（基于真实观测）
+        "signal_state": signal_state,
+        "gap_windows": [w.to_dict() for w in windows],
+        "valid_ranges": valid_ranges,
+        "observed_values": values,
+        "value_std": round(std_v, 6),
+        "value_mean": round(mean_v, 6),
+    }
 
 
 # ---------------------------------------------------------------------------
